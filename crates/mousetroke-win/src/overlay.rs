@@ -8,8 +8,8 @@
 //!
 //! 以后若换 Direct2D 渲染，架构不变，只替换渲染后端。
 
-use windows::Win32::Foundation::{GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
-use windows::core::PCWSTR;
+use windows::Win32::Foundation::{GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::core::{w, PCWSTR};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetTextExtentPoint32W, SelectObject, TextOutW,
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BLENDFUNCTION, BITMAPINFO, BITMAPINFOHEADER,
@@ -17,7 +17,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, KillTimer, RegisterClassW, SetTimer,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, KillTimer, RegisterClassW, RemovePropW,
+    SetPropW, SetTimer,
     SetWindowPos, ShowWindow, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
     SWP_NOSENDCHANGING, SWP_NOSIZE, UpdateLayeredWindow, UpdateLayeredWindowIndirect, CS_HREDRAW, CS_VREDRAW,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -94,6 +95,7 @@ unsafe impl Send for Overlay {}
 impl Drop for Overlay {
     fn drop(&mut self) {
         unsafe {
+            let _ = RemovePropW(self.hwnd, w!("NonRudeHWND"));
             let _ = DestroyWindow(self.hwnd);
             let _ = DeleteDC(self.mem_dc);
             let _ = DeleteObject(HGDIOBJ(self._dib.0));
@@ -162,6 +164,10 @@ impl Overlay {
                 None,
             )
             .ok()?;
+
+            // 声明非全屏窗口，防止全虚拟屏常驻顶层窗被 Explorer 判定为 rude fullscreen 而压低任务栏。
+            let _ = SetPropW(hwnd, w!("NonRudeHWND"), Some(HANDLE(1usize as *mut core::ffi::c_void)));
+            mark_not_fullscreen(hwnd);
 
             // 32bpp 顶向下 DIB，预乘 ARGB
             let mem_dc = CreateCompatibleDC(None);
@@ -426,6 +432,7 @@ impl Overlay {
         if on && !self.visible {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                mark_not_fullscreen(self.hwnd);
             }
             self.visible = true;
         }
@@ -756,6 +763,30 @@ impl Overlay {
             self.show(true); // 首次提交成功后再显示
         }
         self.last_present = Some(std::time::Instant::now());
+    }
+}
+
+/// 通知 Windows Shell 当前覆盖层不是全屏独占窗口，避免任务栏被压低或无法唤出。
+unsafe fn mark_not_fullscreen(hwnd: HWND) {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{ITaskbarList2, TaskbarList};
+
+    // 引擎线程默认未初始化 COM；S_OK / S_FALSE 均需配对 Uninitialize，模式冲突时则不能
+    let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+    {
+        let taskbar: windows::core::Result<ITaskbarList2> =
+            CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER);
+        if let Ok(taskbar) = taskbar {
+            if taskbar.HrInit().is_ok() {
+                let _ = taskbar.MarkFullscreenWindow(hwnd, false);
+            }
+        }
+    }
+    if init {
+        CoUninitialize();
     }
 }
 
