@@ -1,0 +1,25 @@
+name: Build Windows Exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/mousetroke-settings/ui/package-lock.json
+      - name: Build mousetroke.exe
+        shell: cmd
+        run: scripts\build.cmd
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mousetroke-windows
+          path: dist/mousetroke.exe
+          if-no-files-found: error
