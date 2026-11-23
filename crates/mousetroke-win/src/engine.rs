@@ -84,14 +84,7 @@ impl Host for SystemHost {
         std::thread::spawn(move || if click { input::replay_click(btn) } else { input::replay_down(btn) });
     }
     fn execute(&self, action: Action, target: Option<Target>, vars: Vars, pos: (i32, i32)) {
-        std::thread::spawn(move || {
-            // 只有会向目标窗口发送输入或操作窗口的动作才受 UIPI 影响；启动程序、打开网址等不提示
-            let to_window = matches!(action, Action::KeySequence { .. } | Action::WindowOp { .. } | Action::Preset { .. } | Action::Lua { .. });
-            if let (true, Some(t)) = (to_window, &target) {
-                warn_if_elevated(t.pid);
-            }
-            execute(action, target.map(Into::into), vars, pos)
-        });
+        std::thread::spawn(move || execute(action, target.map(Into::into), vars, pos));
     }
     fn label_anchor(&self, x: i32, y: i32) -> (i32, i32) {
         use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
@@ -181,6 +174,12 @@ pub(crate) fn warn_if_elevated(pid: u32) {
 
 /// 执行动作（工作线程）。
 fn execute(action: Action, target: Option<targeting::Target>, vars: Vars, pos: (i32, i32)) {
+    // 只有会向目标窗口发送输入或操作窗口的动作才受 UIPI 影响；启动程序、打开网址等不提示。
+    // 放在这里而不是 Host::execute：弹出菜单里选中的动作也走这里，同样要检查。
+    let to_window = matches!(action, Action::KeySequence { .. } | Action::WindowOp { .. } | Action::Preset { .. } | Action::Lua { .. });
+    if let (true, Some(t)) = (to_window, &target) {
+        warn_if_elevated(t.pid);
+    }
     let Some(action) = mousetroke_engine::prepare_action(action, mousetroke_core::caps::Platform::Windows, mousetroke_core::i18n::lang()) else { return };
     let action = match action {
         PreparedAction::Advanced(action) => action,
@@ -218,7 +217,12 @@ fn execute(action: Action, target: Option<targeting::Target>, vars: Vars, pos: (
         }
         Action::OpenUrl { url_template, browser } => {
             let mut v = vars.clone();
-            fill_lazy_vars(&url_template, &mut v);
+            // 搜索、翻译、打开选中的链接：没读到这次选中的文字就提示并停止，不打开网页
+            if !fill_lazy_vars(&url_template, &mut v) {
+                crate::log!("没有读到选中的文字，未打开网页");
+                push_toast(mousetroke_core::i18n::t(mousetroke_core::i18n::keys::OVERLAY_NO_SELECTION).into(), 1600);
+                return;
+            }
             input::open_url(&vars::expand_url(&url_template, &v), browser.as_deref());
         }
         Action::LaunchApp { exe, args, elevate, win_class, win_title, regex, if_running, .. } => {
@@ -261,14 +265,19 @@ fn execute(action: Action, target: Option<targeting::Target>, vars: Vars, pos: (
 }
 
 /// 惰性变量：模板引用了但上下文没有 → 现场采集。
-fn fill_lazy_vars(template: &str, vars: &mut Vars) {
+/// 返回 false 表示模板需要选中文字但没有读到（此时填入空串）。
+fn fill_lazy_vars(template: &str, vars: &mut Vars) -> bool {
+    let mut selected = true;
     if template.contains("%MS_SELECTED_TEXT%") && !vars.contains_key("MS_SELECTED_TEXT") {
-        vars.insert("MS_SELECTED_TEXT".into(), input::capture_selected_text().unwrap_or_default());
+        let text = input::capture_selected_text();
+        selected = text.is_some();
+        vars.insert("MS_SELECTED_TEXT".into(), text.unwrap_or_default());
     }
     if template.contains("%MS_CLIPBOARD_TEXT%") && !vars.contains_key("MS_CLIPBOARD_TEXT") {
         let text = input::get_clipboard_text().unwrap_or_default();
         vars.insert("MS_CLIPBOARD_TEXT".into(), text);
     }
+    selected
 }
 
 #[cfg(test)]
