@@ -1,25 +1,37 @@
-name: Build Windows Exe
+name: Build Windows EXE
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main, master]
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: crates/mousetroke-settings/ui/package-lock.json
-      - name: Build mousetroke.exe
+          node-version: '22'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run overlay tests
+        run: cargo test -p mousetroke-win
+
+      - name: Run official build script
         shell: cmd
         run: scripts\build.cmd
-      - uses: actions/upload-artifact@v7
+
+      - name: Upload built executable
+        uses: actions/upload-artifact@v4
         with:
-          name: mousetroke-windows
-          path: dist/mousetroke.exe
-          if-no-files-found: error
+          name: mousetroke-win-patched
+          path: |
+            target/release/mousetroke.exe
+            target/release/mousetroke-settings.exe
+            dist/**
+            release/**
+          if-no-files-found: warn
