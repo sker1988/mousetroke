@@ -462,4 +462,500 @@ impl Overlay {
         }
     }
 
-    /// 退出置顶并隐藏，彻底从 Topmost 队列与
+/// 退出置顶并隐藏，彻底从 Topmost 队列与 DWM 合成层中移出。
+    fn hide(&mut self) {
+        if self.visible {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_NOTOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_HIDEWINDOW,
+                );
+            }
+            self.visible = false;
+        }
+    }
+
+    /// 虚拟屏矩形 (x, y, w, h)——边缘/角落热区检测与显示同步用（返回真实虚拟屏尺寸）。
+    pub fn virtual_rect(&self) -> (i32, i32, i32, i32) {
+        (self.vx, self.vy, self.width, self.virtual_height)
+    }
+
+    fn to_local(&self, x: i32, y: i32) -> (f64, f64) {
+        ((x - self.vx) as f64, (y - self.vy) as f64)
+    }
+
+    fn union_bounds(&mut self, rect: &RECT) {
+        let clamped = RECT {
+            left: rect.left.clamp(-8, self.width + 8),
+            top: rect.top.clamp(-8, self.height + 8),
+            right: rect.right.clamp(-8, self.width + 8),
+            bottom: rect.bottom.clamp(-8, self.height + 8),
+        };
+        self.content_bounds = Some(match self.content_bounds {
+            Some(b) => RECT {
+                left: b.left.min(clamped.left),
+                top: b.top.min(clamped.top),
+                right: b.right.max(clamped.right),
+                bottom: b.bottom.max(clamped.bottom),
+            },
+            None => clamped,
+        });
+    }
+
+    /// 画一小段（胶囊形）：按像素到线段的距离算覆盖度——核心 + 中层 + 光晕三档，
+    /// 与已有像素**取最大**而不是叠加，拐角、端点、重叠处浓淡一致。返回脏矩形。
+    fn stroke(&mut self, a: (f64, f64), b: (f64, f64)) -> RECT {
+        let hw = self.half_width;
+        let reach = hw * 4.0 + 1.5;
+        let x0 = (a.0.min(b.0) - reach).floor().max(0.0) as i32;
+        let y0 = (a.1.min(b.1) - reach).floor().max(0.0) as i32;
+        let x1 = (a.0.max(b.0) + reach).ceil().min(self.width as f64 - 1.0) as i32;
+        let y1 = (a.1.max(b.1) + reach).ceil().min(self.height as f64 - 1.0) as i32;
+        if x1 < x0 || y1 < y0 {
+            return RECT { left: i32::MAX, top: i32::MAX, right: i32::MIN, bottom: i32::MIN };
+        }
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let l2 = dx * dx + dy * dy;
+        let ca = self.color.0 as f64 / 255.0;
+        for py in y0..=y1 {
+            for px in x0..=x1 {
+                let (cx, cy) = (px as f64, py as f64);
+                let t = if l2 > 0.0 { (((cx - a.0) * dx + (cy - a.1) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                let d = (cx - a.0 - t * dx).hypot(cy - a.1 - t * dy);
+                let cov = |r: f64| (r + 0.5 - d).clamp(0.0, 1.0);
+                let v = (255.0 * cov(hw)).max(110.0 * cov(hw * 2.0)).max(36.0 * cov(hw * 4.0));
+                if v >= 1.0 {
+                    self.trail_pixel(px, py, (v * ca) as u8);
+                }
+            }
+        }
+        RECT { left: x0, top: y0, right: x1 + 1, bottom: y1 + 1 }
+    }
+
+    /// 轨迹像素：透明度取最大。落在标签区域内时写入标签下层并重新合成。
+    fn trail_pixel(&mut self, x: i32, y: i32, a: u8) {
+        let (_, r, g, b) = self.color;
+        let v = premul(a, r, g, b);
+        unsafe {
+            let p = self.pixels.add(y as usize * self.width as usize + x as usize);
+            if let (Some((l, t, rr, bb)), false) = (self.label_rect, self.label_under.is_empty()) {
+                if x >= l && x < rr && y >= t && y < bb {
+                    let j = ((y - t) * (rr - l) + (x - l)) as usize;
+                    if a as u32 > self.label_under[j] >> 24 {
+                        self.label_under[j] = v;
+                        *p = over(self.label_layer[j], v);
+                    }
+                    return;
+                }
+            }
+            if a as u32 > *p >> 24 {
+                *p = v;
+            }
+        }
+    }
+
+    /// 以 (cx, cy)（屏幕坐标）为中心绘制手势名：深色半透明圆角底板 + 文字
+    /// （GDI 灰度抗锯齿 → alpha 掩码）。底板保证白底网页上也看得清。
+    pub fn draw_label(&mut self, text: &str, cx: i32, cy: i32, color: &str) {
+        unsafe {
+            // 懒初始化暂存 DC；字体随语言与字号更新。
+            let lang = mousetroke_core::i18n::lang();
+            if self.scratch_dc.is_invalid() {
+                self.scratch_dc = CreateCompatibleDC(None);
+            }
+            if self.font_tag != lang.tag() {
+                use windows::Win32::Graphics::Gdi as gdi;
+                let face: Vec<u16> = mousetroke_core::i18n::ui_font(lang).encode_utf16().chain([0]).collect();
+                let font = gdi::CreateFontW(
+                    -(self.font_size as i32),
+                    0,
+                    0,
+                    0,
+                    700,
+                    0,
+                    0,
+                    0,
+                    gdi::FONT_CHARSET(1),
+                    gdi::FONT_OUTPUT_PRECISION(0),
+                    gdi::FONT_CLIP_PRECISION(0),
+                    gdi::FONT_QUALITY(4), // ANTIALIASED：灰度抗锯齿才能当 alpha 掩码（ClearType 会有彩边）
+                    0,
+                    PCWSTR(face.as_ptr()),
+                );
+                SelectObject(self.scratch_dc, HGDIOBJ(font.0));
+                if !self.font.is_invalid() {
+                    let _ = DeleteObject(HGDIOBJ(self.font.0));
+                }
+                self.font = font;
+                self.font_tag = lang.tag();
+            }
+            // 还原旧标签下方的内容（之后一并提交）
+            let old = self.label_rect;
+            self.clear_label_inner();
+
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let mut size = windows::Win32::Foundation::SIZE::default();
+            if !GetTextExtentPoint32W(self.scratch_dc, &wide, &mut size).as_bool() {
+                return;
+            }
+            const PAD_X: i32 = 12;
+            const PAD_Y: i32 = 5;
+            if size.cx + PAD_X * 2 > self.width || size.cy + PAD_Y * 2 > self.height {
+                return;
+            }
+            // 字号最高 96 px，文字宽度也可能远超旧的 1024 px；缓冲区只在需要时增长。
+            if self.scratch_ptr.is_null() || size.cx > self.scratch_width || size.cy > self.scratch_height {
+                let sw = (size.cx.max(1) as u32).next_power_of_two().max(256) as i32;
+                let sh = (size.cy.max(1) as u32).next_power_of_two().max(64) as i32;
+                let bmi = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: sw,
+                        biHeight: -sh,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+                let dib = CreateDIBSection(Some(self.scratch_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                    .unwrap_or_default();
+                if dib.is_invalid() || bits.is_null() {
+                    return;
+                }
+                SelectObject(self.scratch_dc, HGDIOBJ(dib.0));
+                if !self._scratch_dib.is_invalid() {
+                    let _ = DeleteObject(HGDIOBJ(self._scratch_dib.0));
+                }
+                self._scratch_dib = dib;
+                self.scratch_ptr = bits as *mut u32;
+                self.scratch_width = sw;
+                self.scratch_height = sh;
+            }
+            // 白字黑底 → 亮度即 alpha 掩码
+            std::ptr::write_bytes(
+                self.scratch_ptr as *mut u8,
+                0,
+                (self.scratch_width * self.scratch_height * 4) as usize,
+            );
+            let _ = windows::Win32::Graphics::Gdi::SetTextColor(
+                self.scratch_dc,
+                COLORREF(0x00FFFFFF),
+            );
+            let _ = windows::Win32::Graphics::Gdi::SetBkColor(self.scratch_dc, COLORREF(0));
+            let _ = TextOutW(self.scratch_dc, 0, 0, &wide);
+
+            let (a, r, g, b) = parse_argb(color);
+            // 底板几何（本地坐标）：文字四周留白，圆角
+            const RADIUS: f32 = 9.0;
+            const BG: (u8, u8, u8, u8) = (0xC8, 20, 24, 28);
+            let (bw, bh) = (size.cx + PAD_X * 2, size.cy + PAD_Y * 2);
+            if bw > self.width || bh > self.height {
+                return;
+            }
+            let bx = ((cx - self.vx) - bw / 2).clamp(0, self.width - bw);
+            let by = ((cy - self.vy) - bh / 2).clamp(0, self.height - bh);
+
+            // 标签层：底板（圆角覆盖率抗锯齿）+ 文字
+            let mut layer = vec![0u32; (bw * bh) as usize];
+            for row in 0..bh {
+                for col in 0..bw {
+                    let cov = rounded_cover(col as f32 + 0.5, row as f32 + 0.5, bw as f32, bh as f32, RADIUS);
+                    if cov > 0.0 {
+                        layer[(row * bw + col) as usize] = premul((BG.0 as f32 * cov) as u8, BG.1, BG.2, BG.3);
+                    }
+                }
+            }
+            for row in 0..size.cy {
+                for col in 0..size.cx {
+                    let v = *self.scratch_ptr.add(row as usize * self.scratch_width as usize + col as usize);
+                    let lum = (v >> 16) & 0xff; // 白字：R 通道即亮度
+                    if lum >= 8 {
+                        let k = ((row + PAD_Y) * bw + col + PAD_X) as usize;
+                        layer[k] = over(premul((a as u32 * lum / 255) as u8, r, g, b), layer[k]);
+                    }
+                }
+            }
+            // 保存下方内容，合成上屏
+            let mut under = Vec::with_capacity(layer.len());
+            for row in 0..bh {
+                let base = self.pixels.add((by + row) as usize * self.width as usize + bx as usize);
+                for col in 0..bw {
+                    let p = base.add(col as usize);
+                    under.push(*p);
+                    *p = over(layer[(row * bw + col) as usize], *p);
+                }
+            }
+            self.label_layer = layer;
+            self.label_under = under;
+            self.label_rect = Some((bx, by, bx + bw, by + bh));
+            let mut rect = RECT { left: bx - 1, top: by - 1, right: bx + bw + 1, bottom: by + bh + 1 };
+            if let Some((l, t, r, b)) = old {
+                rect = union_rect(&rect, &RECT { left: l, top: t, right: r, bottom: b });
+            }
+            self.union_bounds(&rect);
+            self.present_dirty(&rect, false);
+        }
+    }
+
+    /// 清除当前标签（不提交）：还原下方内容；淡出中（下层已丢弃）则清零。
+    fn clear_label_inner(&mut self) {
+        let Some((l, t, r, b)) = self.label_rect.take() else { return };
+        let under = std::mem::take(&mut self.label_under);
+        self.label_layer.clear();
+        let w = (r - l) as usize;
+        unsafe {
+            for y in t.max(0)..b.min(self.height) {
+                let row = self.pixels.add(y as usize * self.width as usize + l as usize);
+                if under.len() == w * (b - t) as usize {
+                    std::ptr::copy_nonoverlapping(under.as_ptr().add((y - t) as usize * w), row, w);
+                } else {
+                    std::ptr::write_bytes(row, 0, w);
+                }
+            }
+        }
+    }
+
+    /// 清除当前标签并提交（隐藏态不唤醒窗口）。
+    pub fn clear_label(&mut self) {
+        self.clear_label_inner();
+        if !self.visible {
+            return;
+        }
+        let rect = self.content_bounds.unwrap_or(RECT {
+            left: 0,
+            top: 0,
+            right: 8,
+            bottom: 8,
+        });
+        self.present_dirty(&rect, true);
+    }
+
+    // ------------------------------------------------------------ 提交
+
+    /// 脏矩形提交（`UpdateLayeredWindowIndirect` + prcDirty）。
+    /// `force = true` 忽略节流（动画帧）。被节流的区域并入 pending，
+    /// 随后任何一次提交都会覆盖。
+    fn present_dirty(&mut self, dirty: &RECT, force: bool) {
+        if dirty.left >= dirty.right || dirty.top >= dirty.bottom {
+            return;
+        }
+        // 节流：距上次提交 <6ms 则暂存（缓冲区内容是最新的，下次提交带出）
+        if !force {
+            if let Some(t) = self.last_present {
+                if t.elapsed().as_millis() < 6 {
+                    self.pending_dirty = Some(match self.pending_dirty.take() {
+                        Some(p) => union_rect(&p, dirty),
+                        None => *dirty,
+                    });
+                    return;
+                }
+            }
+        }
+        let rect = match self.pending_dirty.take() {
+            Some(p) => union_rect(&p, dirty),
+            None => *dirty,
+        };
+        unsafe {
+            let size = SIZE { cx: self.width, cy: self.height };
+            let src = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let info = UPDATELAYEREDWINDOWINFO {
+                cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+                hdcDst: HDC(std::ptr::null_mut()),
+                pptDst: std::ptr::null(),
+                psize: &size,
+                hdcSrc: self.mem_dc,
+                pptSrc: &src,
+                crKey: COLORREF(0),
+                pblend: &blend,
+                dwFlags: windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
+                prcDirty: &rect,
+            };
+            if !UpdateLayeredWindowIndirect(self.hwnd, &info).as_bool() {
+                // 回退整窗提交（只报一次）
+                if !self.ulw_warned {
+                    self.ulw_warned = true;
+                    let e = windows::core::Error::from_thread();
+                    crate::log!("UpdateLayeredWindowIndirect 失败: {e}，回退整窗");
+                }
+                let _ = UpdateLayeredWindow(
+                    self.hwnd,
+                    None,
+                    None,
+                    Some(&size),
+                    Some(self.mem_dc),
+                    Some(&src),
+                    COLORREF(0),
+                    Some(&blend),
+                    windows::Win32::UI::WindowsAndMessaging::ULW_ALPHA,
+                );
+            }
+        }
+        if !self.visible {
+            self.show(); // 首次提交成功后再置顶显示
+        }
+        self.last_present = Some(std::time::Instant::now());
+    }
+}
+
+fn union_rect(a: &RECT, b: &RECT) -> RECT {
+    RECT {
+        left: a.left.min(b.left),
+        top: a.top.min(b.top),
+        right: a.right.max(b.right),
+        bottom: a.bottom.max(b.bottom),
+    }
+}
+
+unsafe extern "system" fn overlay_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_TIMER && wparam.0 == FADE_TIMER_ID {
+        // 淡出动画帧（引擎线程消息循环泵送，不阻塞钩子回调）
+        crate::engine::with_engine(|e| e.overlay_tick());
+        return LRESULT(0);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// 预乘 ARGB 像素。
+fn premul(a: u8, r: u8, g: u8, b: u8) -> u32 {
+    let a32 = a as u32;
+    (a32 << 24) | ((r as u32 * a32 / 255) << 16) | ((g as u32 * a32 / 255) << 8) | (b as u32 * a32 / 255)
+}
+
+/// 预乘 ARGB 合成：src over dst。
+fn over(src: u32, dst: u32) -> u32 {
+    let k = 255 - (src >> 24);
+    let ch = |sh: u32| (((src >> sh) & 0xff) + ((dst >> sh) & 0xff) * k / 255).min(255) << sh;
+    ch(24) | ch(16) | ch(8) | ch(0)
+}
+
+/// 轨迹半宽（px）。
+fn half_width(width_px: f64) -> f64 {
+    (width_px / 2.0 + 0.4).max(1.0)
+}
+
+/// 圆角矩形 (0,0,w,h) 在点 (x,y) 处的覆盖率（0~1，边缘 1px 抗锯齿）。
+fn rounded_cover(x: f32, y: f32, w: f32, h: f32, r: f32) -> f32 {
+    let qx = (x - w / 2.0).abs() - (w / 2.0 - r);
+    let qy = (y - h / 2.0).abs() - (h / 2.0 - r);
+    let outside = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - r;
+    (0.5 - outside).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 显示器布局变化会在同一进程里重建覆盖层：类已注册不能导致创建失败，旧的要能正常释放。
+    #[test]
+    fn recreate_overlay_in_same_process() {
+        for size in [16, 24, 96] {
+            let mut o = Overlay::new("#00C2FF08", 2.0).expect("overlay");
+            o.set_label_font_size(size);
+            o.start_session(o.vx + 10, o.vy + 10);
+            o.line_to(o.vx + 40, o.vy + 10);
+            o.draw_label("测试", o.vx + 100, o.vy + 100, "#FFFFFF08");
+            o.finish();
+        }
+    }
+
+    /// 淡出途中开始新手势：上次的轨迹必须清零（曾因先 take 走包围盒而残留在屏幕上）。
+    #[test]
+    fn new_session_clears_interrupted_fade() {
+        let mut o = Overlay::new("#00C2FF08", 2.0).expect("overlay");
+        let (vx, vy) = (o.vx, o.vy);
+        o.start_session(vx + 100, vy + 100);
+        for i in 1..20 {
+            o.line_to(vx + 100 + i * 3, vy + 100);
+        }
+        o.draw_label("测试", vx + 300, vy + 300, "#FFFFFF08");
+        o.fade_out();
+        o.tick_fade(); // 淡出到一半被打断
+        o.start_session(vx + 900, vy + 900);
+        let px = |o: &Overlay, x: i32, y: i32| unsafe { *o.pixels.add(y as usize * o.width as usize + x as usize) };
+        for y in 90..110 {
+            for x in 90..180 {
+                assert_eq!(px(&o, x, y), 0, "轨迹残留于 ({x},{y})");
+            }
+        }
+        for y in 270..330 {
+            for x in 240..360 {
+                assert_eq!(px(&o, x, y), 0, "标签残留于 ({x},{y})");
+            }
+        }
+        o.finish();
+    }
+
+    /// 手动查看轨迹与标签渲染：`cargo test -p mousetroke-win label_render -- --ignored`，
+    /// 输出 BMP 到 MT_LABEL_OUT。左半白底、右半黑底。
+    /// 轨迹为带抖动的 →↓→；中途在路径上显示标签再清除（轨迹不应被擦掉）；最后显示标签。
+    #[test]
+    #[ignore]
+    fn label_render() {
+        let mut o = Overlay::new("#00C2FFE0", 2.0).expect("overlay");
+        let (w, h) = (640i32, 400i32);
+        let (vx, vy) = (o.vx, o.vy);
+        let jitter = |i: i32| (i * 7919) % 5 - 2;
+        let mut pts = Vec::new();
+        for i in 0..40 { pts.push((60 + i * 6, 60 + jitter(i) / 2 + i / 8)); }
+        for i in 0..45 { pts.push((300 + jitter(i) - i / 6, 65 + i * 6)); }
+        for i in 0..40 { pts.push((293 + i * 6, 335 + jitter(i) / 2 + i / 10)); }
+        o.start_session(vx + pts[0].0, vy + pts[0].1);
+        for (k, &(x, y)) in pts.iter().enumerate() {
+            o.line_to(vx + x, vy + y);
+            if k == 70 {
+                o.draw_label("Enter", vx + x, vy + y - 34, "#FFFFFFE6"); // 盖在竖线上
+            }
+            if k == 90 {
+                o.clear_label();
+            }
+        }
+        if std::env::var("MT_LABEL_MATCHED").is_ok() {
+            o.draw_label("关闭标签页 Ctrl+W", vx + 520, vy + 330, "#FF7A00F2");
+        } else {
+            o.draw_label("未识别  → ↓ →", vx + 520, vy + 330, "#FFFFFFE6");
+        }
+        let mut bmp = Vec::new();
+        let row = (w * 3 + 3) & !3;
+        let size = 54 + row * h;
+        bmp.extend(b"BM");
+        bmp.extend((size as u32).to_le_bytes());
+        bmp.extend([0u8; 4]);
+        bmp.extend(54u32.to_le_bytes());
+        bmp.extend(40u32.to_le_bytes());
+        bmp.extend(w.to_le_bytes());
+        bmp.extend(h.to_le_bytes());
+        bmp.extend(1u16.to_le_bytes());
+        bmp.extend(24u16.to_le_bytes());
+        bmp.extend([0u8; 24]);
+        for y in (0..h).rev() {
+            for x in 0..w {
+                let p = unsafe { *o.pixels.add(y as usize * o.width as usize + x as usize) };
+                let a = (p >> 24) & 0xff;
+                let bg = if x < w / 2 { 255 } else { 0 };
+                let c = |sh: u32| ((p >> sh) & 0xff) + bg * (255 - a) / 255;
+                bmp.extend([c(0) as u8, c(8) as u8, c(16) as u8]);
+            }
+            bmp.extend(std::iter::repeat_n(0u8, (row - w * 3) as usize));
+        }
+        std::fs::write(std::env::var("MT_LABEL_OUT").unwrap_or("label.bmp".into()), bmp).unwrap();
+    }
+}
